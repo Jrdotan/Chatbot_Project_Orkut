@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import wikipedia
 import tkinter as tk
@@ -14,11 +15,45 @@ import pyttsx3
 import threading
 
 # ==========================================
+# CONFIGURAÇÃO DE LOGGING
+# ==========================================
+LOG_FILE = "chatbot.log"
+
+# Configura logging
+def setup_logging():
+    logger = logging.getLogger("chatbot")
+    logger.setLevel(logging.DEBUG)
+
+    if logger.handlers:
+        return logger
+
+    formatter = logging.Formatter(
+        "%(asctime)s | %(levelname)-8s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(formatter)
+
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(formatter)
+
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+
+    return logger
+
+logger = setup_logging()
+
+# ==========================================
 # CARREGAMENTO DINÂMICO DOS ARQUIVOS JSON
 # ==========================================
 knowledge_base = []
 fact_categories = {}
 
+# Carrega JSONs
 def load_knowledge_base():
     global knowledge_base, fact_categories
     knowledge_base = []
@@ -35,11 +70,15 @@ def load_knowledge_base():
                     for item in dados:
                         knowledge_base.append(item)
                         fact_categories[item] = category
+                logger.info("JSON carregado: %s (%d fatos, categoria: %s)", file_name, len(dados), category)
             except Exception as e:
-                print(f"Erro ao carregar {file_name}: {e}")
-                
+                logger.error("Erro ao carregar %s: %s", file_name, e, exc_info=True)
+        else:
+            logger.warning("Arquivo JSON não encontrado: %s", file_name)
+
     # Fallback se nenhum arquivo for carregado
     if not knowledge_base:
+        logger.warning("Nenhum JSON carregado — usando base de conhecimento padrão (fallback)")
         knowledge_base = [
             "Orkut foi uma rede social criada em 2004 por Orkut Büyükkökten.",
             "O Orkut era muito popular no Brasil e na Índia.",
@@ -53,21 +92,35 @@ def load_knowledge_base():
 
 # Inicializa a base
 load_knowledge_base()
-print(f"Base de conhecimento carregada com {len(knowledge_base)} fatos.")
+logger.info("Base de conhecimento carregada com %d fatos.", len(knowledge_base))
 
-# ==========================================
-# REGRAS E PROCESSAMENTO NLP
-# ==========================================
 welcome_inputs = ["hi", "hello", "hey", "oi", "olá", "bom dia", "boa tarde", "boa noite"]
 welcome_outputs = ["Olá! Seja bem-vindo ao Orkut!", "Oi! Como posso te ajudar hoje?", "Hey! Tudo tranquilo por aí?", "Olá! Pode perguntar sobre o Orkut :)"]
 
+TYPO_FIXES = {"oorkut": "orkut", "orkutt": "orkut", "orkuttt": "orkut", "orcut": "orkut"}
+STOP_WORDS_PT = [
+    "o", "a", "os", "as", "um", "uma", "de", "do", "da", "dos", "das", "em", "no", "na",
+    "nos", "nas", "e", "que", "foi", "ser", "eh", "é", "the", "is", "was", "por", "para",
+    "com", "sem", "ao", "aos", "à", "às", "se", "sua", "seu", "suas", "seus", "meu", "minha",
+    "aconteceu", "acontecer", "happened", "what", "with", "the",
+]
+
+TOPIC_KEYWORDS = {
+    "jogo": ["jogo", "jogos", "game", "games", "aplicativo", "aplicativos", "app", "apps", "opensocial"],
+    "scrap": ["scrap", "scraps", "recado", "recados", "scrapbook", "mural"],
+    "comunidade": ["comunidade", "comunidades", "forum", "fórum"],
+    "foto": ["foto", "fotos", "fotografia", "album", "álbum"],
+    "amigo": ["amigo", "amigos", "amiga", "amizade", "depoimento", "depoimentos", "testemunho"],
+    "encerramento": ["encerramento", "encerrar", "descontinuado", "descontinuar", "fim", "fechou", "fechamento", "shutdown"],
+    "criacao": ["criado", "criou", "criação", "criar", "lançado", "lançamento", "fundado", "surgiu"],
+}
+
+# Detecta saudações
 def welcome_message(text):
-    # Divide o texto em palavras limpas
     words = re.sub(r'[^a-zA-Záéíóúãõâêôç ]', '', text.lower()).split()
     for word in welcome_inputs:
         if word in words:
             return random.choice(welcome_outputs)
-    # Suporta saudações compostas
     text_clean = re.sub(r'[^a-zA-Záéíóúãõâêôç ]', '', text.lower())
     for phrase in ["bom dia", "boa tarde", "boa noite"]:
         if phrase in text_clean:
@@ -75,9 +128,8 @@ def welcome_message(text):
     return None
 
 stem_mapping = {
-    "criar": "criar", "criou": "criar", "criaram": "criar", "criando": "criar", 
-    "criador": "criar", "criadores": "criar", "criado": "criar", "criada": "criar", 
-    "criadas": "criar", "criados": "criar", "criação": "criar", "criou-se": "criar",
+    "criou": "criar", "criaram": "criar", "criando": "criar", "criou-se": "criar",
+    "criado": "criar", "criada": "criar",
     "comunidade": "comunidade", "comunidades": "comunidade",
     "amigo": "amigo", "amigos": "amigo", "amiga": "amigo", "amigas": "amigo", 
     "amizade": "amigo", "amizades": "amigo",
@@ -87,6 +139,81 @@ stem_mapping = {
     "popularizado": "popular", "popularidade": "popular"
 }
 
+# Corrige typos
+def normalize_input(text):
+    t = text.lower()
+    for typo, fix in TYPO_FIXES.items():
+        t = t.replace(typo, fix)
+    return t
+
+# Extrai tópicos
+def extract_question_topics(text):
+    t = normalize_input(text)
+    return [topic for topic, keywords in TOPIC_KEYWORDS.items()
+            if any(re.search(rf"\b{re.escape(kw)}\b", t) for kw in keywords)]
+
+# Valida tópico
+def fact_matches_topics(fact, topics):
+    if not topics:
+        return True
+    t = normalize_input(fact)
+    return any(
+        re.search(rf"\b{re.escape(kw)}\b", t)
+        for topic in topics for kw in TOPIC_KEYWORDS[topic]
+    )
+
+# Detecta intenção
+def detect_intent(text):
+    t = normalize_input(text)
+    if re.search(r"\bquando\b", t):
+        return "temporal"
+    if re.search(r"\bquem\b", t):
+        return "pessoa"
+    if re.search(r"\bonde\b", t):
+        return "local"
+    if re.search(r"\b(como|por que|porque)\b", t):
+        return "explicacao"
+    return "geral"
+
+# Reforça relevância
+def intent_score_boost(fact, intent, user_text=""):
+    bonus = 0.0
+    if intent == "temporal":
+        if re.search(r"\b(19|20)\d{2}\b", fact):
+            bonus += 0.18
+        if re.search(r"\b(janeiro|fevereiro|março|abril|maio|junho|julho|agosto|setembro|outubro|novembro|dezembro)\b", fact, re.I):
+            bonus += 0.10
+        if re.search(r"\b(criado|lançado|fundado|inaugurado|descontinuado|encerramento|encerrou)\b", fact, re.I):
+            bonus += 0.12
+        topic = temporal_topic(user_text)
+        if topic != "geral" and temporal_topic(fact) == topic:
+            bonus += 0.15
+    elif intent == "pessoa":
+        if re.search(r"\b(orkut büyükkökten|büyükkökten|criador|engenheiro|fundador|google)\b", fact, re.I):
+            bonus += 0.15
+    elif intent == "local":
+        if re.search(r"\b(brasil|índia|estados unidos|turquia|país|países)\b", fact, re.I):
+            bonus += 0.15
+        if re.search(r"\b(onde|popular|país|países)\b", user_text, re.I):
+            if re.search(r"\b(brasil|índia|estados unidos)\b", fact, re.I) and re.search(
+                r"\b(segundo|primeiro|país|popular|ativo|atrás)\b", fact, re.I
+            ):
+                bonus += 0.25
+    elif intent == "explicacao":
+        if re.search(r"\b(porque|pois|devido|objetivo|motivo|razão)\b", fact, re.I):
+            bonus += 0.10
+    return bonus
+
+# Classifica período
+def temporal_topic(text):
+    t = normalize_input(text)
+    if re.search(r"\b(criado|criação|criou|lançado|fundado|surgiu|nasceu|inaugurado)\b", t):
+        return "origem"
+    if re.search(r"\b(descontinuado|encerr|encerrou|acabou|fim|morreu)\b", t):
+        return "fim"
+    return "geral"
+
+# Reduz palavras
 def simple_portuguese_stemmer(word):
     word = word.lower()
     if word in stem_mapping:
@@ -96,14 +223,15 @@ def simple_portuguese_stemmer(word):
             word = word[:-1]
     return word
 
+# Limpa texto
 def preprocess(sentence):
-    sentence = sentence.lower()
+    sentence = normalize_input(sentence)
     sentence = re.sub(r'[^a-zA-Záéíóúãõâêôç ]', '', sentence)
     tokens = sentence.split()
     stemmed = [simple_portuguese_stemmer(t) for t in tokens]
     return " ".join(stemmed)
 
-# Helper para formatar a capitalização da primeira letra de frases conectadas
+# Formata frase
 def format_sentence(sentence):
     if not sentence:
         return ""
@@ -111,76 +239,113 @@ def format_sentence(sentence):
     if not words:
         return sentence
     first_word = words[0]
-    # Se for uma palavra reservada/nome próprio, não altera
     if first_word in ["Orkut", "Brasil", "Índia", "Google", "HTML", "Java", "OpenSocial", "Takeout", "MySpace", "Facebook"]:
         return sentence
     return sentence[0].lower() + sentence[1:]
 
-# Motor de Busca NLP: similaridade de cossenos para respostas abrangentes
-def get_answer(user_text, threshold=0.12):
+# Busca resposta
+def get_answer(user_text, threshold=0.22):
     if not knowledge_base:
         return None
 
+    intent = detect_intent(user_text)
+    question_topics = extract_question_topics(user_text)
     cleaned_base = [preprocess(s) for s in knowledge_base]
     user_text_clean = preprocess(user_text)
-
-    # Adiciona o texto do usuário ao final para vetorizar
     corpus = cleaned_base + [user_text_clean]
 
     try:
-        tfidf = TfidfVectorizer()
+        tfidf = TfidfVectorizer(stop_words=STOP_WORDS_PT)
         matrix = tfidf.fit_transform(corpus)
     except Exception as e:
-        print(f"Erro na vetorização: {e}")
+        logger.error("Erro NLP na vetorização TF-IDF: %s", e, exc_info=True)
         return None
 
-    # Calcula a similaridade da pergunta contra a base local
     similarity = cosine_similarity(matrix[-1], matrix)[0]
-    scores = similarity[:-1] # Remove a auto-similaridade da pergunta
+    scores = list(similarity[:-1])
 
-    # Encontra correspondências acima do limite (threshold)
-    matching_indices = [i for i, score in enumerate(scores) if score >= threshold]
+    for i, fact in enumerate(knowledge_base):
+        scores[i] += intent_score_boost(fact, intent, user_text)
+        if "orkut" in user_text_clean and "orkut" in fact.lower():
+            scores[i] += 0.06
 
-    if not matching_indices:
+    for i, fact in enumerate(knowledge_base):
+        scores[i] += intent_score_boost(fact, intent, user_text)
+        if "orkut" in user_text_clean and "orkut" in fact.lower():
+            scores[i] += 0.06
+        if question_topics:
+            if fact_matches_topics(fact, question_topics):
+                scores[i] += 0.30
+            else:
+                scores[i] -= 0.40
+
+    if question_topics:
+        topic_indices = [i for i, fact in enumerate(knowledge_base) if fact_matches_topics(fact, question_topics)]
+        if topic_indices:
+            best_idx = max(topic_indices, key=lambda i: scores[i])
+        else:
+            logger.debug("Nenhum fato sobre tópicos %s", question_topics)
+            return None
+    else:
+        best_idx = max(range(len(scores)), key=lambda i: scores[i])
+    best_score = scores[best_idx]
+
+    if best_score < threshold:
+        logger.debug("Nenhum match acima do threshold (%.2f). Melhor score: %.3f", threshold, best_score)
         return None
 
-    # Ordena por relevância (score decrescente)
-    sorted_matches = sorted(matching_indices, key=lambda x: scores[x], reverse=True)
+    ranked = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
+    if question_topics:
+        ranked = [i for i in ranked if fact_matches_topics(knowledge_base[i], question_topics)]
+    top_idx = ranked[0]
+    responses = [knowledge_base[top_idx]]
 
-    # Pega até os 3 principais resultados para compor uma resposta abrangente
-    top_matches = sorted_matches[:3]
-    responses = [knowledge_base[idx] for idx in top_matches]
+    logger.debug(
+        "Intent=%s | topics=%s | score=%.3f | fato=%s",
+        intent, question_topics or "geral", best_score, knowledge_base[top_idx][:70],
+    )
 
-    # Constrói o parágrafo enriquecido usando conectores
+    for idx in ranked[1:3]:
+        if scores[idx] < threshold:
+            break
+        if intent == "temporal" and temporal_topic(user_text) != "geral":
+            if temporal_topic(knowledge_base[idx]) != temporal_topic(user_text):
+                continue
+        if scores[idx] / scores[top_idx] >= 0.88:
+            responses.append(knowledge_base[idx])
+
     if len(responses) == 1:
-        answer = responses[0]
-    elif len(responses) == 2:
-        answer = f"{responses[0]} Além disso, {format_sentence(responses[1])}"
-    else:
-        answer = f"{responses[0]} Além disso, {format_sentence(responses[1])} Também vale ressaltar que {format_sentence(responses[2])}"
+        return responses[0]
+    if len(responses) == 2:
+        return f"{responses[0]} Além disso, {format_sentence(responses[1])}"
+    return f"{responses[0]} Além disso, {format_sentence(responses[1])} Também vale ressaltar que {format_sentence(responses[2])}"
 
-    return answer
-
-# Fallback: Pesquisa dinâmica na Wikipédia em português
+# Consulta Wikipedia
 def buscar_no_wikipedia(query):
+    query = normalize_input(query)
     try:
         wikipedia.set_lang("pt")
-        # Busca pelos tópicos relacionados
         results = wikipedia.search(query)
         if results:
-            for result in results[:3]: # Tenta os primeiros resultados para evitar erros de desambiguação
+            for result in results[:3]:
                 try:
                     summary = wikipedia.summary(result, sentences=2)
+                    logger.info("Wikipedia — resultado encontrado para '%s': %s", query, result)
                     return f"Não encontrei isso na base local do Orkut, mas pesquisei no Wikipédia e descobri o seguinte:\n\n\"{summary}\""
-                except (wikipedia.exceptions.DisambiguationError, wikipedia.exceptions.PageError):
+                except (wikipedia.exceptions.DisambiguationError, wikipedia.exceptions.PageError) as e:
+                    logger.debug("Wikipedia — resultado descartado '%s': %s", result, e)
                     continue
+            logger.warning("Wikipedia — nenhum resultado válido para: %s", query)
+        else:
+            logger.info("Wikipedia — nenhum resultado encontrado para: %s", query)
     except Exception as e:
-        print(f"Erro ao buscar no Wikipedia: {e}")
+        logger.error("Erro ao buscar no Wikipedia para '%s': %s", query, e, exc_info=True)
     return None
 
 # ==========================================
 # ANÁLISE DE SENTIMENTO E IDIOMA
 # ==========================================
+# Verifica idioma
 def check_language(text):
     try:
         lang = detect(text)
@@ -188,69 +353,87 @@ def check_language(text):
     except LangDetectException:
         return "pt"
 
+# Analisa sentimento
 def get_sentiment_intervention(text):
     try:
-        # Traduz para inglês para maior precisão do TextBlob
         translated = GoogleTranslator(source='auto', target='en').translate(text)
         blob = TextBlob(translated)
         polarity = blob.sentiment.polarity
         
         if polarity <= -0.3:
             return "Notei que você parece um pouco chateado. O Orkut era justamente um lugar para relaxar e fazer amigos! Mas, sobre o que você perguntou: "
-    except Exception:
-        pass
+    except Exception as e:
+        logger.error("Erro NLP na análise de sentimento: %s", e, exc_info=True)
     return ""
 
-# ==========================================
-# FLUXO PRINCIPAL DO CHATBOT
-# ==========================================
-def chatbot_response(user_text):
-    # 1. Verifica idioma
-    lang = check_language(user_text)
-    if lang != 'pt' and len(user_text.split()) > 2:
-        return "Desculpe, meu banco de dados é focado no Orkut em português. Por favor, pergunte em português."
-        
-    # 2. Verifica regras / saudações
-    rule = welcome_message(user_text)
-    if rule:
-        return rule
-        
-    # 3. Intervenção de humor (sentimento)
-    intervention = get_sentiment_intervention(user_text)
-    
-    # 4. Busca base local (híbrido cossenos)
-    answer = get_answer(user_text)
-    
-    # 5. Fallback para o Wikipedia
-    if not answer:
-        answer = buscar_no_wikipedia(user_text)
-        
-    # 6. Fallback final se nada der certo
-    if not answer:
-        answer = "Desculpe, não encontrei uma resposta abrangente sobre isso na base do Orkut e nem no Wikipédia."
-        
-    return intervention + answer if intervention else answer
+PORTUGUESE_MARKERS = re.compile(
+    r"\b(o|a|os|as|que|quem|quando|onde|como|por|para|do|da|em|foi|era|eram|"
+    r"comunidade|depoimento|perfil|amigo|amigos)\b",
+    re.I,
+)
+ENGLISH_MARKERS = re.compile(
+    r"\b(when|what|who|where|how|why|was|were|is|are|the|you|create|created|hello|hey)\b",
+    re.I,
+)
 
-# ==========================================
-# SINTETIZADOR DE VOZ (SOM / TTS)
-# ==========================================
+# Traduz entrada
+def translate_to_portuguese(text):
+    lang = check_language(text)
+    if lang == "pt":
+        return text, "pt"
+    if PORTUGUESE_MARKERS.search(text) and not ENGLISH_MARKERS.search(text):
+        return text, "pt"
+    try:
+        translated = GoogleTranslator(source="auto", target="pt").translate(text)
+        logger.info("Tradução %s→pt: '%s' → '%s'", lang, text, translated)
+        return translated, lang
+    except Exception as e:
+        logger.error("Erro tradução: %s", e, exc_info=True)
+        return text, lang
+
+# Orquestra resposta
+def chatbot_response(user_text):
+    try:
+        query_pt, original_lang = translate_to_portuguese(user_text)
+
+        rule = welcome_message(user_text)
+        if rule:
+            return rule
+
+        intervention = get_sentiment_intervention(query_pt)
+        answer = get_answer(query_pt)
+
+        if not answer:
+            answer = buscar_no_wikipedia(query_pt)
+
+        if not answer:
+            answer = "Desculpe, não encontrei uma resposta abrangente sobre isso na base do Orkut e nem no Wikipédia."
+
+        return intervention + answer if intervention else answer
+    except Exception as e:
+        logger.error("Exceção inesperada ao processar pergunta '%s': %s", user_text, e, exc_info=True)
+        return "Desculpe, ocorreu um erro interno ao processar sua pergunta. Tente novamente."
+
+# Sintetiza voz
 def speak_response(text):
     try:
         engine = pyttsx3.init()
-        # Ajusta a velocidade de fala um pouco mais suave
         engine.setProperty('rate', 150)
-        # Fala o texto
-        # Para evitar ler blocos longos com citações complicadas da Wikipedia por voz, vamos ler apenas o primeiro parágrafo
         speak_text = text.split('\n')[0]
         engine.say(speak_text)
         engine.runAndWait()
     except Exception as e:
-        print(f"Erro no TTS: {e}")
+        logger.error("Erro TTS ao sintetizar voz: %s", e, exc_info=True)
 
 # ==========================================
 # INTERFACE GRÁFICA TKINTER (ORKUT)
 # ==========================================
 if __name__ == "__main__":
+    logger.info("=" * 50)
+    logger.info("Inicialização do sistema — Chatbot Orkut")
+    logger.info("Arquivo de log: %s", os.path.abspath(LOG_FILE))
+    logger.info("=" * 50)
+
     root = tk.Tk()
     root.title("Orkut - Chatbot")
     root.geometry("950x750")
@@ -325,38 +508,44 @@ if __name__ == "__main__":
     entrada = tk.Entry(input_frame, width=70, font=("Arial", 12))
     entrada.pack(side=tk.LEFT, padx=10)
 
-    # Função para enviar mensagens
+    # Envia mensagem
     def send_message(event=None):
         user_text = entrada.get().strip()
         if user_text == "":
             return "break"
-        
-        chat_window.config(state=tk.NORMAL)
-        
-        # Adiciona a mensagem do Usuário como Scrap
-        chat_window.insert(tk.END, "Você ", "user_name")
-        chat_window.insert(tk.END, "deixou um scrap:\n", "meta_text")
-        chat_window.insert(tk.END, user_text + "\n", "user_msg")
-        chat_window.insert(tk.END, "-" * 105 + "\n", "separator")
-        
-        # Obtém resposta abrangente do chatbot
-        response = chatbot_response(user_text)
-        
-        # Adiciona a resposta do Bot como Scrap
-        chat_window.insert(tk.END, "Chatbot do Orkut ", "bot_name")
-        chat_window.insert(tk.END, "deixou um scrap:\n", "meta_text")
-        chat_window.insert(tk.END, response + "\n", "bot_msg")
-        chat_window.insert(tk.END, "-" * 105 + "\n", "separator")
-        
-        chat_window.see(tk.END)
-        chat_window.config(state=tk.DISABLED)
-        
-        # Limpa campo
-        entrada.delete(0, tk.END)
-        
-        # Inicia a fala em segundo plano
-        threading.Thread(target=speak_response, args=(response,), daemon=True).start()
-        
+
+        try:
+            logger.info("Pergunta do usuário: %s", user_text)
+
+            chat_window.config(state=tk.NORMAL)
+
+            # Adiciona a mensagem do Usuário como Scrap
+            chat_window.insert(tk.END, "Você ", "user_name")
+            chat_window.insert(tk.END, "deixou um scrap:\n", "meta_text")
+            chat_window.insert(tk.END, user_text + "\n", "user_msg")
+            chat_window.insert(tk.END, "-" * 105 + "\n", "separator")
+
+            # Obtém resposta abrangente do chatbot
+            response = chatbot_response(user_text)
+            logger.info("Resposta gerada: %s", response)
+
+            # Adiciona a resposta do Bot como Scrap
+            chat_window.insert(tk.END, "Chatbot do Orkut ", "bot_name")
+            chat_window.insert(tk.END, "deixou um scrap:\n", "meta_text")
+            chat_window.insert(tk.END, response + "\n", "bot_msg")
+            chat_window.insert(tk.END, "-" * 105 + "\n", "separator")
+
+            chat_window.see(tk.END)
+            chat_window.config(state=tk.DISABLED)
+
+            # Limpa campo
+            entrada.delete(0, tk.END)
+
+            # Inicia a fala em segundo plano
+            threading.Thread(target=speak_response, args=(response,), daemon=True).start()
+        except Exception as e:
+            logger.error("Exceção inesperada na interface: %s", e, exc_info=True)
+
         return "break" # Evita que a tecla Enter insira uma quebra de linha indesejada
 
     # Vincula a tecla Enter e o botão para enviar
